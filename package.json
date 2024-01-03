@@ -43,6 +43,7 @@
   "scripts": {
     "build": "tsc",
     "lint": "biome ci src test",
+    "lint:fix": "biome check --apply src test",
     "test": "vitest --run --dir test"
   }
 }

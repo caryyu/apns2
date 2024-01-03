@@ -23,6 +23,12 @@ export interface SigningToken {
   timestamp: number
 }
 
+export interface TokenCacheManager {
+  getToken(): Promise<SigningToken | null>
+  setToken(token: SigningToken | null): Promise<void>
+  hasToken(): Promise<boolean>
+}
+
 export interface ApnsOptions {
   team: string
   signingKey: Secret
@@ -31,6 +37,35 @@ export interface ApnsOptions {
   host?: Host | string
   requestTimeout?: number
   pingInterval?: number
+  tokenCacheManager?: TokenCacheManager
+}
+
+export class SimpleTokenCacheManager implements TokenCacheManager {
+  private _token: SigningToken | null
+
+  constructor() {
+    this._token = null
+  }
+
+  async getToken(): Promise<SigningToken | null> {
+    await this.checkValidation()
+    return this._token
+  }
+
+  async setToken(token: SigningToken | null): Promise<void> {
+    this._token = token
+  }
+
+  async hasToken(): Promise<boolean> {
+    await this.checkValidation()
+    return !!this._token
+  }
+
+  private async checkValidation(): Promise<void> {
+    if (this._token && Date.now() - this._token.timestamp > RESET_TOKEN_INTERVAL_MS) {
+      await this.setToken(null)
+    }
+  }
 }
 
 export class ApnsClient extends EventEmitter {
@@ -41,8 +76,7 @@ export class ApnsClient extends EventEmitter {
   readonly defaultTopic?: string
   readonly requestTimeout?: number
   readonly pingInterval?: number
-
-  private _token: SigningToken | null
+  readonly tokenCacheManager: TokenCacheManager
 
   constructor(options: ApnsOptions) {
     super()
@@ -53,7 +87,7 @@ export class ApnsClient extends EventEmitter {
     this.host = options.host ?? Host.production
     this.requestTimeout = options.requestTimeout
     this.pingInterval = options.pingInterval
-    this._token = null
+    this.tokenCacheManager = options.tokenCacheManager || new SimpleTokenCacheManager()
     this.on(Errors.expiredProviderToken, () => this._resetSigningToken())
   }
 
@@ -62,7 +96,7 @@ export class ApnsClient extends EventEmitter {
   }
 
   sendMany(notifications: Notification[]) {
-    const promises = notifications.map((notification) => {
+    const promises = notifications.map(async (notification) => {
       return this._send(notification).catch((error: any) => ({ error }))
     })
     return Promise.all(promises)
@@ -71,10 +105,14 @@ export class ApnsClient extends EventEmitter {
   private async _send(notification: Notification) {
     const token = encodeURIComponent(notification.deviceToken)
     const url = `https://${this.host}/${API_VERSION}/device/${token}`
+    const signingToken = await this._getToken()
+    if (!signingToken) {
+      throw new Error('No signing token set.')
+    }
     const options: RequestInit = {
       method: 'POST',
       headers: {
-        authorization: `bearer ${this._getSigningToken()}`,
+        authorization: `bearer ${signingToken.value}`,
         'apns-push-type': notification.pushType,
         'apns-topic': notification.options.topic ?? this.defaultTopic
       },
@@ -125,11 +163,17 @@ export class ApnsClient extends EventEmitter {
     throw json
   }
 
-  private _getSigningToken(): string {
-    if (this._token && Date.now() - this._token.timestamp < RESET_TOKEN_INTERVAL_MS) {
-      return this._token.value
+  private async _getToken(): Promise<SigningToken | null> {
+    const has = await this.tokenCacheManager.hasToken()
+    if (has) {
+      return this.tokenCacheManager.getToken()
     }
+    const token = this._generateSigningToken()
+    await this.tokenCacheManager.setToken(token)
+    return token
+  }
 
+  private _generateSigningToken(): SigningToken {
     const claims = {
       iss: this.team,
       iat: Math.floor(Date.now() / 1000)
@@ -143,15 +187,13 @@ export class ApnsClient extends EventEmitter {
       }
     })
 
-    this._token = {
+    return {
       value: token,
       timestamp: Date.now()
     }
-
-    return token
   }
 
   private _resetSigningToken() {
-    this._token = null
+    this.tokenCacheManager.setToken(null)
   }
 }
